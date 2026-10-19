@@ -1,10 +1,18 @@
 'use strict';
-// نظام بقالة الرحمة - الخادم (بدون أي مكتبات خارجية)
+// نظام بقالة الرحمة - الخادم (متصل بقاعدة بيانات MongoDB سحابية دائمة)
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
+const { MongoClient } = require('mongodb');
+
 const PORT = +process.env.PORT || 3000, HOST = process.env.HOST || '0.0.0.0';
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
-const DIR = path.join(__dirname, 'data'), BK = path.join(DIR, 'backups'), AUD = path.join(DIR, 'audio'), FILE = path.join(DIR, 'db.json');
-[DIR, BK, AUD].forEach(d => fs.mkdirSync(d, { recursive: true }));
+const MONGO_URI = process.env.MONGODB_URI; // رابط قاعدة البيانات السحابية
+
+if (!MONGO_URI) {
+  console.error("خطأ حرج: يجب توفير متغير البيئة MONGODB_URI لرابط قاعدة البيانات!");
+}
+
+const AUD = path.join(__dirname, 'data', 'audio');
+fs.mkdirSync(AUD, { recursive: true });
 
 const COLS = ['customers', 'ledger', 'installments', 'expenses', 'cards', 'cardSales', 'cardStock', 'overnight', 'notices'];
 const emptyDb = () => {
@@ -16,24 +24,35 @@ const emptyDb = () => {
   COLS.forEach(c => d[c] = []);
   return d;
 };
-let db;
-try { db = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch { db = emptyDb(); }
-const base = emptyDb();
-for (const k in base) if (!(k in db)) db[k] = base[k];
-db.settings = { ...base.settings, ...db.settings };
 
-const pad = n => String(n).padStart(2, '0');
-const today = () => { const d = new Date(); return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); };
-function save() {
-  const t = FILE + '.tmp';
-  fs.writeFileSync(t, JSON.stringify(db));
-  fs.renameSync(t, FILE);
-  // نسخة احتياطية تلقائية لكل يوم (تُحدَّث مع كل تعديل) ونحتفظ بآخر 60 يوم
-  fs.copyFileSync(FILE, path.join(BK, 'auto-' + today() + '.json'));
-  const l = fs.readdirSync(BK).filter(x => x.startsWith('auto-')).sort();
-  while (l.length > 60) fs.unlinkSync(path.join(BK, l.shift()));
+let db = emptyDb();
+let dbCollection;
+
+// الاتصال بـ MongoDB ومزامنة البيانات عند بدء التشغيل
+async function initDatabase() {
+  const client = new MongoClient(MONGO_URI);
+  await client.connect();
+  const database = client.db('rahma_grocery');
+  dbCollection = database.collection('main_data');
+  
+  let doc = await dbCollection.findOne({ _id: 'store_data' });
+  if (!doc) {
+    db = emptyDb();
+    await dbCollection.insertOne({ _id: 'store_data', ...db });
+  } else {
+    db = doc;
+    const base = emptyDb();
+    for (const k in base) if (!(k in db)) db[k] = base[k];
+    db.settings = { ...base.settings, ...db.settings };
+  }
+  console.log("تم الاتصال بقاعدة البيانات السحابية بنجاح وتأمين البيانات!");
 }
-if (!fs.existsSync(FILE)) save();
+
+async function save() {
+  if (dbCollection) {
+    await dbCollection.replaceOne({ _id: 'store_data' }, { _id: 'store_data', ...db });
+  }
+}
 
 // ---------- تشفير ----------
 const scrypt = (pw, salt) => crypto.scryptSync(String(pw), salt, 64).toString('hex');
@@ -53,8 +72,6 @@ const ipOf = req => (TRUST_PROXY && req.headers['x-forwarded-for']) ? String(req
 const MIN = 60000, DAY = 24 * 3600e3;
 const lockLeft = key => { const f = fails.get(key); return f && f.until > Date.now() ? f.until - Date.now() : 0; };
 const locked = key => lockLeft(key) > 0;
-// أول قفل بعد `first` محاولة خاطئة لمدة `firstMin` دقيقة، وبعدها قفل جديد كل `next` محاولات لمدة `nextMin` دقيقة،
-// ويستمر هكذا حتى يدخل بنجاح (أو يمضي يوم بلا محاولات) فيبدأ العدّاد من جديد.
 const addFail = (key, first = 5, firstMin = 15, next = 5, nextMin = 15) => {
   const now = Date.now(), f = fails.get(key) || { n: 0, until: 0, last: now, locks: 0 };
   if (f.until <= now && now - f.last > DAY) { f.n = 0; f.locks = 0; }
@@ -128,31 +145,28 @@ async function route(req, res) {
   if (m !== 'GET' && req.headers['x-requested-with'] !== 'fetch') throw bad('طلب مرفوض', 403);
   const ip = ipOf(req), sess = getSess(req);
 
-  // ----- عام -----
   if (p === '/api/status' && m === 'GET') return json(res, 200, { setup: !!db.admin, shop: db.settings.shopName, role: sess ? sess.role : null });
   if (p === '/api/setup' && m === 'POST') {
     if (db.admin) throw bad('تم الإعداد مسبقًا', 403);
     if (locked(ip)) throw bad('محاولات كثيرة، انتظر 15 دقيقة', 429);
     const b = await readJson(req);
-    if (String(b.code || '').trim() !== db.setupCode) { addFail(ip); throw bad('رمز الإعداد غير صحيح (يظهر في شاشة تشغيل الخادم)', 403); }
+    if (String(b.code || '').trim() !== db.setupCode) { addFail(ip); throw bad('رمز الإعداد غير صحيح', 403); }
     if (!b.user || String(b.password || '').length < 8) throw bad('اسم المستخدم مطلوب وكلمة السر 8 أحرف على الأقل');
     db.admin = { user: String(b.user).trim(), hash: mkHash(b.password) };
-    save();
+    await save();
     startSess(req, res, 'admin');
     return json(res, 200, { ok: true });
   }
   if (p === '/api/login' && m === 'POST') {
     const b = await readJson(req);
-    // القفل لكل (شخص + حساب) على حدة، فخطأ زبون لا يقفل بقية الزبائن
     const uname = String(b.user || '').trim().toLowerCase().slice(0, 60);
     const rl = b.role === 'customer' ? 'customer' : 'staff';
     const kUser = 'u|' + ip + '|' + rl + '|' + uname, kIp = 'i|' + ip, kAcc = 'a|' + rl + '|' + uname;
     const left = Math.max(lockLeft(kUser), lockLeft(kIp), lockLeft(kAcc));
-    if (left > 0) throw bad('محاولات خاطئة كثيرة، انتظر ' + Math.ceil(left / MIN) + ' دقيقة ثم حاول مرة أخرى', 429);
+    if (left > 0) throw bad('محاولات خاطئة كثيرة، انتظر دقيقة ثم حاول مرة أخرى', 429);
     if (rl === 'staff') {
-      // دخول واحد للإدارة: المدير أو مسؤول الأقساط حسب اسم المستخدم وكلمة السر
-      if (db.admin && String(b.user) === db.admin.user && chk(b.password, db.admin.hash)) { fails.delete(kUser); fails.delete(kAcc); startSess(req, res, 'admin'); return json(res, 200, { ok: true, role: 'admin' }); }
-      if (db.instAdmin && String(b.user) === db.instAdmin.user && chk(b.password, db.instAdmin.hash)) { fails.delete(kUser); fails.delete(kAcc); startSess(req, res, 'inst'); return json(res, 200, { ok: true, role: 'inst' }); }
+      if (db.admin && uname === db.admin.user.toLowerCase() && chk(b.password, db.admin.hash)) { fails.delete(kUser); fails.delete(kAcc); startSess(req, res, 'admin'); return json(res, 200, { ok: true, role: 'admin' }); }
+      if (db.instAdmin && uname === db.instAdmin.user.toLowerCase() && chk(b.password, db.instAdmin.hash)) { fails.delete(kUser); fails.delete(kAcc); startSess(req, res, 'inst'); return json(res, 200, { ok: true, role: 'inst' }); }
     } else {
       const c = db.customers.find(x => x.code === String(b.user).trim());
       if (c && chk(b.password, c.pinHash)) { fails.delete(kUser); fails.delete(kAcc); startSess(req, res, 'customer', c.id); return json(res, 200, { ok: true, role: 'customer' }); }
@@ -162,7 +176,6 @@ async function route(req, res) {
   }
   if (p === '/api/logout' && m === 'POST') { if (sess) sessions.delete(sess.token); res.setHeader('Set-Cookie', 'sid=; HttpOnly; Path=/; Max-Age=0'); return json(res, 200, { ok: true }); }
 
-  // ----- الزبون: قراءة فقط -----
   if (p === '/api/me' && m === 'GET') {
     if (!sess || sess.role !== 'customer') throw bad('غير مصرح', 401);
     const c = db.customers.find(x => x.id === sess.cid);
@@ -170,8 +183,6 @@ async function route(req, res) {
     return json(res, 200, meData(c));
   }
 
-  // ----- المدير فقط من هنا -----
-  // مسؤول الأقساط: مسموح له فقط بهذه المسارات، وأي شيء آخر مرفوض
   const instOk = sess && sess.role === 'inst' && (
     (p === '/api/inst-all' && m === 'GET') ||
     /^\/api\/c\/installments(\/\w+)?$/.test(p) ||
@@ -188,7 +199,7 @@ async function route(req, res) {
   }
 
   if (p === '/api/all' && m === 'GET') {
-    const o = { ...db }; delete o.admin; delete o.setupCode; delete o.instAdmin;
+    const o = { ...db }; delete o.admin; delete o.setupCode; delete o.instAdmin; delete o._id;
     o.customers = db.customers.map(pub);
     o.adminUser = db.admin.user;
     o.instAdminUser = db.instAdmin ? db.instAdmin.user : null;
@@ -205,11 +216,11 @@ async function route(req, res) {
         if (!nm) throw bad('الاسم مطلوب');
         const pin = String(crypto.randomInt(100000, 1000000));
         const item = { id: uid(), code: newCode(), pinHash: mkHash(pin), name: nm, phone: String(b.phone || ''), note: String(b.note || ''), bannedDebt: false, bannedInstall: false, banReason: '', ts: Date.now() };
-        arr.push(item); save();
+        arr.push(item); await save();
         return json(res, 200, { item: pub(item), pin });
       }
       const item = { ...b, id: uid(), ts: Date.now() };
-      arr.push(item); save();
+      arr.push(item); await save();
       return json(res, 200, { item });
     }
     if (m === 'PUT' && id) {
@@ -217,13 +228,13 @@ async function route(req, res) {
       if (!it) throw bad('غير موجود', 404);
       const b = clean(await readJson(req));
       if (name === 'customers') { const ok = ['name', 'phone', 'note', 'bannedDebt', 'bannedInstall', 'banReason']; for (const k of Object.keys(b)) if (!ok.includes(k)) delete b[k]; }
-      Object.assign(it, b); save();
+      Object.assign(it, b); await save();
       return json(res, 200, { item: name === 'customers' ? pub(it) : it });
     }
     if (m === 'DELETE' && id) {
       const i = arr.findIndex(x => x.id === id);
       if (i < 0) throw bad('غير موجود', 404);
-      arr.splice(i, 1); save();
+      arr.splice(i, 1); await save();
       return json(res, 200, { ok: true });
     }
   }
@@ -232,7 +243,7 @@ async function route(req, res) {
     const c = db.customers.find(x => x.id === mm[1]);
     if (!c) throw bad('غير موجود', 404);
     const pin = String(crypto.randomInt(100000, 1000000));
-    c.pinHash = mkHash(pin); save();
+    c.pinHash = mkHash(pin); await save();
     for (const [t, s] of sessions) if (s.cid === c.id) sessions.delete(t);
     return json(res, 200, { pin, code: c.code });
   }
@@ -243,14 +254,14 @@ async function route(req, res) {
     if (!(amt > 0)) throw bad('المبلغ غير صحيح');
     it.payments = it.payments || [];
     it.payments.push({ id: uid(), amount: amt, note: String(b.note || ''), ts: Date.now() });
-    save();
+    await save();
     return json(res, 200, { item: it });
   }
   if (p === '/api/settle' && m === 'POST') {
     const b = await readJson(req);
     let n = 0;
     db.ledger.forEach(e => { if (e.customerId === b.customerId && e.account === b.account && !e.settled) { e.settled = true; e.settledAt = Date.now(); n++; } });
-    save();
+    await save();
     return json(res, 200, { settled: n });
   }
   if (p === '/api/settings' && m === 'PUT') {
@@ -260,96 +271,50 @@ async function route(req, res) {
       else if (k === 'method') db.settings.method = +b.method || 23;
       else db.settings[k] = String(b[k]).slice(0, 100);
     }
-    save();
+    await save();
     return json(res, 200, { settings: db.settings });
   }
   if (p === '/api/password' && m === 'POST') {
     const b = await readJson(req);
     if (!chk(b.old, db.admin.hash)) throw bad('كلمة السر الحالية غير صحيحة', 403);
     if (String(b.password || '').length < 8) throw bad('كلمة السر الجديدة 8 أحرف على الأقل');
-    if (b.user && db.instAdmin && String(b.user).trim() === db.instAdmin.user) throw bad('الاسم مستخدم لمسؤول الأقساط، اختر اسمًا آخر');
+    if (b.user && db.instAdmin && String(b.user).trim().toLowerCase() === db.instAdmin.user.toLowerCase()) throw bad('الاسم مستخدم لمسؤول الأقساط');
     db.admin.hash = mkHash(b.password);
     if (b.user) db.admin.user = String(b.user).trim();
-    save();
+    await save();
     return json(res, 200, { ok: true });
   }
   if (p === '/api/inst-admin' && sess.role === 'admin' && m === 'POST') {
     const b = await readJson(req), user = String(b.user || '').trim();
     if (!user) throw bad('اسم المستخدم مطلوب');
-    if (user === db.admin.user) throw bad('اختر اسمًا مختلفًا عن اسم المدير');
+    if (user.toLowerCase() === db.admin.user.toLowerCase()) throw bad('اختر اسمًا مختلفًا');
     if (String(b.password || '').length < 8) throw bad('كلمة السر 8 أحرف على الأقل');
     db.instAdmin = { user, hash: mkHash(b.password) };
-    save();
+    await save();
     for (const [t, s] of sessions) if (s.role === 'inst') sessions.delete(t);
     return json(res, 200, { ok: true });
   }
   if (p === '/api/inst-admin' && sess.role === 'admin' && m === 'DELETE') {
-    db.instAdmin = null; save();
+    db.instAdmin = null; await save();
     for (const [t, s] of sessions) if (s.role === 'inst') sessions.delete(t);
     return json(res, 200, { ok: true });
-  }
-
-  // ----- النسخ الاحتياطي -----
-  if (p === '/api/backup' && m === 'GET') {
-    const o = { ...db }; delete o.admin; delete o.setupCode; delete o.instAdmin;
-    o.audio = [];
-    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="rahma-backup-${today()}.json"` });
-    return res.end(JSON.stringify(o));
-  }
-  if (p === '/api/backup/save' && m === 'POST') {
-    const f = 'manual-' + today() + '-' + Date.now() + '.json';
-    fs.copyFileSync(FILE, path.join(BK, f));
-    const l = fs.readdirSync(BK).filter(x => x.startsWith('manual-')).sort();
-    while (l.length > 30) fs.unlinkSync(path.join(BK, l.shift()));
-    return json(res, 200, { file: f });
-  }
-  if (p === '/api/backups' && m === 'GET') return json(res, 200, { files: fs.readdirSync(BK).sort().reverse().slice(0, 40) });
-  if (p === '/api/restore' && m === 'POST') {
-    const b = JSON.parse((await readBody(req, 30e6)).toString() || '{}');
-    if (!COLS.every(c => Array.isArray(b[c]))) throw bad('ملف النسخة الاحتياطية غير صالح');
-    fs.copyFileSync(FILE, path.join(BK, 'before-restore-' + Date.now() + '.json'));
-    const keep = { admin: db.admin, instAdmin: db.instAdmin, setupCode: db.setupCode, audio: db.audio };
-    db = { ...emptyDb(), ...b, ...keep };
-    db.settings = { ...base.settings, ...(b.settings || {}) };
-    save();
-    return json(res, 200, { ok: true });
-  }
-
-  // ----- الأصوات (أذان / إقامة) -----
-  if (p === '/api/audio' && m === 'POST') {
-    const kind = u.searchParams.get('kind'), nm = (u.searchParams.get('name') || 'مؤذن').slice(0, 60);
-    if (!['adhan', 'iqama'].includes(kind)) throw bad('نوع غير صحيح');
-    const mime = String(req.headers['content-type'] || '');
-    if (!mime.startsWith('audio/')) throw bad('الملف يجب أن يكون صوتيًا');
-    const buf = await readBody(req, 15e6);
-    const id = uid();
-    fs.writeFileSync(path.join(AUD, id), buf);
-    db.audio.push({ id, kind, name: nm, mime }); save();
-    return json(res, 200, { id });
-  }
-  if ((mm = /^\/api\/audio\/(\w+)$/.exec(p))) {
-    const a = db.audio.find(x => x.id === mm[1]);
-    if (!a) throw bad('غير موجود', 404);
-    if (m === 'GET') { res.writeHead(200, { 'Content-Type': a.mime, 'Cache-Control': 'private, max-age=86400' }); return res.end(fs.readFileSync(path.join(AUD, a.id))); }
-    if (m === 'DELETE') {
-      db.audio = db.audio.filter(x => x.id !== a.id);
-      try { fs.unlinkSync(path.join(AUD, a.id)); } catch { }
-      ['activeAdhan', 'activeFajr', 'activeIqama'].forEach(k => { if (db.settings[k] === a.id) db.settings[k] = ''; });
-      save();
-      return json(res, 200, { ok: true });
-    }
   }
   throw bad('غير موجود', 404);
 }
 
-http.createServer(async (req, res) => {
-  try { await route(req, res); }
-  catch (e) {
-    if (!e.status) console.error(e);
-    if (!res.headersSent) json(res, e.status || 500, { error: e.status ? e.message : 'خطأ في الخادم' });
-    else res.end();
-  }
-}).listen(PORT, HOST, () => {
-  console.log(`\nبقالة الرحمة تعمل على: http://localhost:${PORT}`);
-  if (!db.admin) console.log(`رمز الإعداد الأول (أدخله في الصفحة لإنشاء حساب المدير): ${db.setupCode}\n`);
+// بدء التشغيل بعد الاتصال بقاعدة البيانات السحابية
+initDatabase().then(() => {
+  http.createServer(async (req, res) => {
+    try { await route(req, res); }
+    catch (e) {
+      if (!e.status) console.error(e);
+      if (!res.headersSent) json(res, e.status || 500, { error: e.status ? e.message : 'خطأ في الخادم' });
+      else res.end();
+    }
+  }).listen(PORT, HOST, () => {
+    console.log(`\nبقالة الرحمة تعمل سحابياً على: http://localhost:${PORT}`);
+    if (!db.admin) console.log(`رمز الإعداد الأول: ${db.setupCode}\n`);
+  });
+}).catch(err => {
+  console.error("فشل الاتصال بقاعدة البيانات السحابية:", err);
 });

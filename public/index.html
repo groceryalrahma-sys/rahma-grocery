@@ -383,7 +383,7 @@ function loginView(){
   const draw=()=>{$('#app').innerHTML=`<div class="login card"><div style="display:flex;justify-content:center">${logo(90)}</div><h2 style="margin:8px 0 0">${esc(STATUS.shop)}</h2><p class="mut">${STATUS.setup?'تسجيل الدخول':'الإعداد الأول للنظام'}</p>
   ${STATUS.setup?`<div class="tabs"><button class="btn ${role==='admin'?'':'ghost'}" data-r="admin">الإدارة</button><button class="btn ${role==='customer'?'':'ghost'}" data-r="customer">زبون</button></div>`:''}
   <form id="lf">${!STATUS.setup?`<label>رمز الإعداد (يظهر في شاشة تشغيل الخادم)<input name="code" required></label>`:''}
-  <label>${role!=='customer'?'اسم المستخدم':'كود الزبون'}<input name="user" required autocomplete="username" ${role==='customer'?'inputmode="numeric"':''}></label>
+  <label>${role!=='customer'?'اسم المستخدم':'كود الزبون'}<input name="user" required autocomplete="username" autocapitalize="off" autocorrect="off" spellcheck="false" ${role==='customer'?'inputmode="numeric"':''}></label>
   <label>${role!=='customer'?'كلمة السر':'الرقم السري'}<input name="password" type="password" required autocomplete="current-password" ${!STATUS.setup?'minlength="8"':''}></label>
   <button class="btn" style="width:100%;padding:11px">${STATUS.setup?'دخول':'إنشاء حساب المدير'}</button></form></div>`;
     document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{role=b.dataset.r;draw()});
@@ -409,8 +409,9 @@ function customerView(){
   try{STATUS=await api('GET','/api/status')}catch{document.body.textContent='تعذر الاتصال بالخادم';return}
   if(!STATUS.role){loginView();return}
   if(STATUS.role==='customer'){try{ME=await api('GET','/api/me');customerView()}catch{loginView()}return}
-  if(STATUS.role==='inst'){ROLE='inst';try{await load()}catch{loginView()}return}
-  try{await load();await loadPrayer();render();startTicker()}catch{loginView()}
+  const fail=e=>{loginView();toast('تعذر فتح الصفحة: '+((e&&e.message)||e),true)};
+  if(STATUS.role==='inst'){ROLE='inst';try{await load()}catch(e){fail(e)}return}
+  try{await load();await loadPrayer();render();startTicker()}catch(e){fail(e)}
 })();
 </script>
 </body>

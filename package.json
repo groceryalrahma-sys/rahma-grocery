@@ -1,1 +1,14 @@
-{ "name": "rahma-grocery", "version": "1.0.0", "private": true, "scripts": { "start": "node server.js" }, "engines": { "node": ">=16" } }
+{
+  "name": "rahma-grocery",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "mongodb": "^6.3.0"
+  }
+}
