@@ -50,8 +50,21 @@ const uid = () => crypto.randomBytes(6).toString('hex');
 const sessions = new Map();
 const fails = new Map();
 const ipOf = req => (TRUST_PROXY && req.headers['x-forwarded-for']) ? String(req.headers['x-forwarded-for']).split(',')[0].trim() : req.socket.remoteAddress;
-const locked = ip => { const f = fails.get(ip); return f && f.until > Date.now(); };
-const addFail = ip => { const f = fails.get(ip) || { n: 0, until: 0 }; f.n++; if (f.n >= 5) { f.until = Date.now() + 15 * 60000; f.n = 0; } fails.set(ip, f); };
+const MIN = 60000, DAY = 24 * 3600e3;
+const lockLeft = key => { const f = fails.get(key); return f && f.until > Date.now() ? f.until - Date.now() : 0; };
+const locked = key => lockLeft(key) > 0;
+// أول قفل بعد `first` محاولة خاطئة لمدة `firstMin` دقيقة، وبعدها قفل جديد كل `next` محاولات لمدة `nextMin` دقيقة،
+// ويستمر هكذا حتى يدخل بنجاح (أو يمضي يوم بلا محاولات) فيبدأ العدّاد من جديد.
+const addFail = (key, first = 5, firstMin = 15, next = 5, nextMin = 15) => {
+  const now = Date.now(), f = fails.get(key) || { n: 0, until: 0, last: now, locks: 0 };
+  if (f.until <= now && now - f.last > DAY) { f.n = 0; f.locks = 0; }
+  else if (f.until <= now && now - f.last > 15 * MIN) f.n = 0;
+  f.last = now; f.n++;
+  const lim = f.locks === 0 ? first : next;
+  if (f.n >= lim) { f.until = now + (f.locks === 0 ? firstMin : nextMin) * MIN; f.locks++; f.n = 0; }
+  fails.set(key, f);
+};
+setInterval(() => { const n = Date.now(); for (const [k, f] of fails) if (f.until <= n && n - f.last > DAY) fails.delete(k); }, 30 * MIN).unref();
 const getSess = req => {
   const m = /(?:^|;\s*)sid=([a-f0-9]{64})/.exec(req.headers.cookie || '');
   if (!m) return null;
@@ -129,17 +142,22 @@ async function route(req, res) {
     return json(res, 200, { ok: true });
   }
   if (p === '/api/login' && m === 'POST') {
-    if (locked(ip)) throw bad('محاولات خاطئة كثيرة، انتظر 15 دقيقة', 429);
     const b = await readJson(req);
-    if (b.role === 'admin') {
-      if (db.admin && String(b.user) === db.admin.user && chk(b.password, db.admin.hash)) { startSess(req, res, 'admin'); return json(res, 200, { ok: true, role: 'admin' }); }
-    } else if (b.role === 'inst') {
-      if (db.instAdmin && String(b.user) === db.instAdmin.user && chk(b.password, db.instAdmin.hash)) { startSess(req, res, 'inst'); return json(res, 200, { ok: true, role: 'inst' }); }
+    // القفل لكل (شخص + حساب) على حدة، فخطأ زبون لا يقفل بقية الزبائن
+    const uname = String(b.user || '').trim().toLowerCase().slice(0, 60);
+    const rl = b.role === 'customer' ? 'customer' : 'staff';
+    const kUser = 'u|' + ip + '|' + rl + '|' + uname, kIp = 'i|' + ip, kAcc = 'a|' + rl + '|' + uname;
+    const left = Math.max(lockLeft(kUser), lockLeft(kIp), lockLeft(kAcc));
+    if (left > 0) throw bad('محاولات خاطئة كثيرة، انتظر ' + Math.ceil(left / MIN) + ' دقيقة ثم حاول مرة أخرى', 429);
+    if (rl === 'staff') {
+      // دخول واحد للإدارة: المدير أو مسؤول الأقساط حسب اسم المستخدم وكلمة السر
+      if (db.admin && String(b.user) === db.admin.user && chk(b.password, db.admin.hash)) { fails.delete(kUser); fails.delete(kAcc); startSess(req, res, 'admin'); return json(res, 200, { ok: true, role: 'admin' }); }
+      if (db.instAdmin && String(b.user) === db.instAdmin.user && chk(b.password, db.instAdmin.hash)) { fails.delete(kUser); fails.delete(kAcc); startSess(req, res, 'inst'); return json(res, 200, { ok: true, role: 'inst' }); }
     } else {
       const c = db.customers.find(x => x.code === String(b.user).trim());
-      if (c && chk(b.password, c.pinHash)) { startSess(req, res, 'customer', c.id); return json(res, 200, { ok: true, role: 'customer' }); }
+      if (c && chk(b.password, c.pinHash)) { fails.delete(kUser); fails.delete(kAcc); startSess(req, res, 'customer', c.id); return json(res, 200, { ok: true, role: 'customer' }); }
     }
-    addFail(ip);
+    addFail(kUser, 10, 15, 5, 20); addFail(kAcc, 20, 15, 20, 15); addFail(kIp, 40, 15, 40, 15);
     throw bad('بيانات الدخول غير صحيحة', 401);
   }
   if (p === '/api/logout' && m === 'POST') { if (sess) sessions.delete(sess.token); res.setHeader('Set-Cookie', 'sid=; HttpOnly; Path=/; Max-Age=0'); return json(res, 200, { ok: true }); }

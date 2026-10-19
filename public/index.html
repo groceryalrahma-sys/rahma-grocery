@@ -381,7 +381,7 @@ document.addEventListener('change',e=>{const el=e.target.closest('[data-c]');if(
 function loginView(){
   let role='admin';
   const draw=()=>{$('#app').innerHTML=`<div class="login card"><div style="display:flex;justify-content:center">${logo(90)}</div><h2 style="margin:8px 0 0">${esc(STATUS.shop)}</h2><p class="mut">${STATUS.setup?'تسجيل الدخول':'الإعداد الأول للنظام'}</p>
-  ${STATUS.setup?`<div class="tabs"><button class="btn ${role==='admin'?'':'ghost'}" data-r="admin">المدير</button><button class="btn ${role==='inst'?'':'ghost'}" data-r="inst">مسؤول الأقساط</button><button class="btn ${role==='customer'?'':'ghost'}" data-r="customer">زبون</button></div>`:''}
+  ${STATUS.setup?`<div class="tabs"><button class="btn ${role==='admin'?'':'ghost'}" data-r="admin">الإدارة</button><button class="btn ${role==='customer'?'':'ghost'}" data-r="customer">زبون</button></div>`:''}
   <form id="lf">${!STATUS.setup?`<label>رمز الإعداد (يظهر في شاشة تشغيل الخادم)<input name="code" required></label>`:''}
   <label>${role!=='customer'?'اسم المستخدم':'كود الزبون'}<input name="user" required autocomplete="username" ${role==='customer'?'inputmode="numeric"':''}></label>
   <label>${role!=='customer'?'كلمة السر':'الرقم السري'}<input name="password" type="password" required autocomplete="current-password" ${!STATUS.setup?'minlength="8"':''}></label>
